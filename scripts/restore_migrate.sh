@@ -19,6 +19,7 @@ BACKUP_PATTERN="isalab15_for_v${VERSION}_"
 TEMPLATE_DB="isalab15_for_v${VERSION}_T"
 TARGET_DB="isalab"
 PG_USER="odoo"
+PG_PASSWORD="odoo"
 
 # Odoo paths
 ODOO_DIR="/opt/odoo/isalab${VERSION}"
@@ -411,7 +412,7 @@ EOF
     print_info "Creating backup (this may take a while)..."
     
     # Create backup with odoo user (consistent ownership, no privileges stored)
-    sudo -u "$PG_USER" pg_dump -h localhost -Fc --no-owner --no-privileges -f "$backup_file" "$TARGET_DB"
+    sudo -u "$PG_USER" PGPASSWORD="$PG_PASSWORD" pg_dump -h localhost -Fc --no-owner --no-privileges -f "$backup_file" "$TARGET_DB"
     
     local size=$(du -h "$backup_file" | cut -f1)
     
