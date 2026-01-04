@@ -17,7 +17,6 @@
     # for the full list
     'category': 'Sales',
     'version': '16.0.1.0.0',
-    'installable': False,  # Temporarily disabled - needs tax_totals_json field fixes for Odoo 16
 
     # any module necessary for this one to work correctly
     'depends': ['sale','crm','mail'],

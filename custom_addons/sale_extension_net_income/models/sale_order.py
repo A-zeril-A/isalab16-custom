@@ -32,8 +32,9 @@ class SaleOrder(models.Model):
         for order in self:
             order.custom_total_net_sum = sum(order.custom_sale_order_ids.mapped('total_net'))
 
-    @api.depends('custom_total_net_sum', 'tax_totals_json')
+    @api.depends('custom_total_net_sum', 'amount_untaxed')
     def _compute_new_total_value(self):
+        """Compute total extra costs (tax not included)"""
         for order in self:
             order.new_total_value = order.amount_untaxed - order.custom_total_net_sum
 
