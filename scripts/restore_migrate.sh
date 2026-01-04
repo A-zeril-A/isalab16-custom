@@ -392,11 +392,11 @@ create_backup_for_next() {
     echo -e "    ${CYAN}Backup:${NC}       ${YELLOW}${backup_name}${NC}"
     echo ""
     
-    # Create backup directory
-    mkdir -p "$backup_folder"
+    # Create backup directory with odoo user
+    sudo -u "$PG_USER" mkdir -p "$backup_folder"
     
-    # Create README
-    cat > "${backup_folder}/README.txt" << EOF
+    # Create README with odoo user
+    sudo -u "$PG_USER" tee "${backup_folder}/README.txt" > /dev/null << EOF
 Backup Information
 ==================
 Source Database: ${TARGET_DB}
@@ -410,8 +410,8 @@ EOF
     
     print_info "Creating backup (this may take a while)..."
     
-    # Create backup
-    sudo -u postgres pg_dump -Fc -f "$backup_file" "$TARGET_DB"
+    # Create backup with odoo user (consistent ownership, no privileges stored)
+    sudo -u "$PG_USER" pg_dump -h localhost -Fc --no-owner --no-privileges -f "$backup_file" "$TARGET_DB"
     
     local size=$(du -h "$backup_file" | cut -f1)
     
