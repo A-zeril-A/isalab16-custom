@@ -9,7 +9,7 @@
 # 4. Creates backup for next version migration (isalab16_for_v17_xxx)
 # =============================================================================
 
-set -e
+set -euo pipefail
 
 # Configuration
 VERSION="16"
@@ -138,11 +138,110 @@ restore_to_template() {
     print_info "Creating template database..."
     sudo -u postgres createdb -O "$PG_USER" "$TEMPLATE_DB"
     
-    # Restore
+    # Restore: --no-owner prevents dump's ownership from being applied
+    # --role sets the role for object creation when running as superuser
     print_info "Restoring backup (this may take a while)..."
-    sudo -u postgres pg_restore -d "$TEMPLATE_DB" --no-owner --no-privileges "$backup_file" 2>&1 || true
     
-    print_success "Template database created: $TEMPLATE_DB"
+    local restore_log=$(mktemp)
+    local restore_exit=0
+    sudo -u postgres pg_restore -d "$TEMPLATE_DB" --no-owner --no-privileges --role="$PG_USER" "$backup_file" 2>"$restore_log" || restore_exit=$?
+    
+    # Check if it's a critical error
+    if [ $restore_exit -ne 0 ]; then
+        if grep -q "FATAL\|could not connect\|database.*does not exist" "$restore_log"; then
+            print_error "Database restore failed!"
+            cat "$restore_log"
+            rm -f "$restore_log"
+            return 1
+        else
+            # Non-critical warnings (missing roles, extensions, etc.) are OK
+            print_warning "Restore completed with warnings (see log for details)"
+        fi
+    else
+        print_success "Restore completed"
+    fi
+    rm -f "$restore_log"
+    
+    # Check ownership BEFORE fixing - only fix if needed
+    print_info "Verifying ownership..."
+    
+    local db_owner=$(sudo -u postgres psql -t -c "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='$TEMPLATE_DB';" | tr -d ' ')
+    local schema_owner=$(sudo -u postgres psql -d "$TEMPLATE_DB" -t -c "SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner WHERE n.nspname = 'public';" | tr -d ' ')
+    local wrong_count=$(sudo -u postgres psql -d "$TEMPLATE_DB" -t -c "
+        SELECT count(*) FROM (
+            SELECT tablename FROM pg_tables WHERE schemaname='public' AND tableowner != '$PG_USER'
+            UNION ALL
+            SELECT sequencename FROM pg_sequences WHERE schemaname='public' AND sequenceowner != '$PG_USER'
+            UNION ALL
+            SELECT viewname FROM pg_views WHERE schemaname='public' AND viewowner != '$PG_USER'
+            UNION ALL
+            SELECT matviewname FROM pg_matviews WHERE schemaname='public' AND matviewowner != '$PG_USER'
+        ) AS wrong_owners;" | tr -d ' ')
+    
+    # Only fix if there are problems
+    if [ "$db_owner" != "$PG_USER" ] || [ "$schema_owner" != "$PG_USER" ] || [ "${wrong_count:-0}" -gt 0 ]; then
+        print_warning "Ownership issues detected (db:$db_owner, schema:$schema_owner, objects:$wrong_count)"
+        print_info "Fixing ownership..."
+        
+        # Fix database owner
+        [ "$db_owner" != "$PG_USER" ] && sudo -u postgres psql -q -c "ALTER DATABASE \"$TEMPLATE_DB\" OWNER TO $PG_USER;"
+        
+        # Fix schema and objects only if needed
+        if [ "$schema_owner" != "$PG_USER" ] || [ "${wrong_count:-0}" -gt 0 ]; then
+            sudo -u postgres psql -d "$TEMPLATE_DB" -q << EOSQL
+ALTER SCHEMA public OWNER TO $PG_USER;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tableowner != '$PG_USER'
+    LOOP EXECUTE 'ALTER TABLE public.' || quote_ident(r.tablename) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT sequencename FROM pg_sequences WHERE schemaname = 'public' AND sequenceowner != '$PG_USER'
+    LOOP EXECUTE 'ALTER SEQUENCE public.' || quote_ident(r.sequencename) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT viewname FROM pg_views WHERE schemaname = 'public' AND viewowner != '$PG_USER'
+    LOOP EXECUTE 'ALTER VIEW public.' || quote_ident(r.viewname) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT matviewname FROM pg_matviews WHERE schemaname = 'public' AND matviewowner != '$PG_USER'
+    LOOP EXECUTE 'ALTER MATERIALIZED VIEW public.' || quote_ident(r.matviewname) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT p.proname, pg_get_function_identity_arguments(p.oid) as args
+             FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+             WHERE n.nspname = 'public' AND pg_get_userbyid(p.proowner) != '$PG_USER'
+    LOOP EXECUTE 'ALTER FUNCTION public.' || quote_ident(r.proname) || '(' || r.args || ') OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT t.typname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid
+             WHERE n.nspname = 'public' AND t.typtype IN ('c','d','e') AND pg_get_userbyid(t.typowner) != '$PG_USER'
+    LOOP EXECUTE 'ALTER TYPE public.' || quote_ident(r.typname) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+EOSQL
+        fi
+        
+        # Verify after fix
+        wrong_count=$(sudo -u postgres psql -d "$TEMPLATE_DB" -t -c "
+            SELECT count(*) FROM (
+                SELECT tablename FROM pg_tables WHERE schemaname='public' AND tableowner != '$PG_USER'
+                UNION ALL
+                SELECT sequencename FROM pg_sequences WHERE schemaname='public' AND sequenceowner != '$PG_USER'
+            ) AS wrong_owners;" | tr -d ' ')
+        
+        if [ "${wrong_count:-0}" -eq 0 ]; then
+            print_success "Template database created: $TEMPLATE_DB (ownership fixed ✓)"
+        else
+            print_warning "Template created but $wrong_count objects still have wrong owner"
+        fi
+    else
+        print_success "Template database created: $TEMPLATE_DB (ownership already correct ✓)"
+    fi
 }
 
 # Create target database from template
@@ -161,7 +260,81 @@ create_from_template() {
     # Create from template
     sudo -u postgres createdb -T "$TEMPLATE_DB" -O "$PG_USER" "$TARGET_DB"
     
-    print_success "Database created: $TARGET_DB (from template)"
+    # Fix: Drop sequences that conflict with Odoo 16 registry setup
+    # These exist in v15 databases and cause "already exists" error in v16
+    # Note: Safe when Odoo processes are stopped and db_user has correct permissions
+    print_info "Cleaning up legacy sequences..."
+    sudo -u postgres psql -d "$TARGET_DB" -c "DROP SEQUENCE IF EXISTS base_registry_signaling CASCADE;" > /dev/null 2>&1 || true
+    sudo -u postgres psql -d "$TARGET_DB" -c "DROP SEQUENCE IF EXISTS base_cache_signaling CASCADE;" > /dev/null 2>&1 || true
+    
+    # Check ownership BEFORE fixing - only fix if needed
+    print_info "Verifying ownership..."
+    
+    local db_owner=$(sudo -u postgres psql -t -c "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='$TARGET_DB';" | tr -d ' ')
+    local schema_owner=$(sudo -u postgres psql -d "$TARGET_DB" -t -c "SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner WHERE n.nspname = 'public';" | tr -d ' ')
+    local wrong_count=$(sudo -u postgres psql -d "$TARGET_DB" -t -c "
+        SELECT count(*) FROM (
+            SELECT tablename FROM pg_tables WHERE schemaname='public' AND tableowner != '$PG_USER'
+            UNION ALL
+            SELECT sequencename FROM pg_sequences WHERE schemaname='public' AND sequenceowner != '$PG_USER'
+        ) AS wrong_owners;" | tr -d ' ')
+    
+    # Only fix if there are problems
+    if [ "$db_owner" != "$PG_USER" ] || [ "$schema_owner" != "$PG_USER" ] || [ "${wrong_count:-0}" -gt 0 ]; then
+        print_warning "Ownership issues detected (db:$db_owner, schema:$schema_owner, objects:$wrong_count)"
+        print_info "Fixing ownership..."
+        
+        [ "$db_owner" != "$PG_USER" ] && sudo -u postgres psql -q -c "ALTER DATABASE \"$TARGET_DB\" OWNER TO $PG_USER;"
+        
+        if [ "$schema_owner" != "$PG_USER" ] || [ "${wrong_count:-0}" -gt 0 ]; then
+            sudo -u postgres psql -d "$TARGET_DB" -q << EOSQL
+ALTER SCHEMA public OWNER TO $PG_USER;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tableowner != '$PG_USER'
+    LOOP EXECUTE 'ALTER TABLE public.' || quote_ident(r.tablename) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT sequencename FROM pg_sequences WHERE schemaname = 'public' AND sequenceowner != '$PG_USER'
+    LOOP EXECUTE 'ALTER SEQUENCE public.' || quote_ident(r.sequencename) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT viewname FROM pg_views WHERE schemaname = 'public' AND viewowner != '$PG_USER'
+    LOOP EXECUTE 'ALTER VIEW public.' || quote_ident(r.viewname) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT matviewname FROM pg_matviews WHERE schemaname = 'public' AND matviewowner != '$PG_USER'
+    LOOP EXECUTE 'ALTER MATERIALIZED VIEW public.' || quote_ident(r.matviewname) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT p.proname, pg_get_function_identity_arguments(p.oid) as args
+             FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+             WHERE n.nspname = 'public' AND pg_get_userbyid(p.proowner) != '$PG_USER'
+    LOOP EXECUTE 'ALTER FUNCTION public.' || quote_ident(r.proname) || '(' || r.args || ') OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+DO \$\$ DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT t.typname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid
+             WHERE n.nspname = 'public' AND t.typtype IN ('c','d','e') AND pg_get_userbyid(t.typowner) != '$PG_USER'
+    LOOP EXECUTE 'ALTER TYPE public.' || quote_ident(r.typname) || ' OWNER TO $PG_USER'; END LOOP;
+END \$\$;
+EOSQL
+        fi
+        
+        # Verify after fix
+        wrong_count=$(sudo -u postgres psql -d "$TARGET_DB" -t -c "SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tableowner != '$PG_USER';" | tr -d ' ')
+        if [ "${wrong_count:-0}" -eq 0 ]; then
+            print_success "Database created: $TARGET_DB (from template, ownership fixed ✓)"
+        else
+            print_warning "Database created but $wrong_count tables still have wrong owner"
+        fi
+    else
+        print_success "Database created: $TARGET_DB (from template, ownership already correct ✓)"
+    fi
 }
 
 # Run OpenUpgrade migration
