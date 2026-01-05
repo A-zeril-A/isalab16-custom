@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <!-- Template for the "Create New Request" button -->
+    <t t-name="MyBusinessTripForms.buttons">
+        <div class="o_list_buttons">
+            <button type="button" class="btn btn-primary o_list_button_create_request">
+                Create New Request
+            </button>
+        </div>
+    </t>
+
+    <!-- Template for the Request Type Selection Dialog Content -->
+    <t t-name="BusinessTripRequestTypeDialog">
+        <div>
+            <p>Please select the type of business trip request you want to create:</p>
+            
+            <div class="row mt-4">
+                <div class="col-md-6 text-center">
+                    <button class="btn btn-info btn-with-quotation btn-lg py-4 px-4 w-100">
+                        <i class="fa fa-link fa-2x mb-2"></i>
+                        <div>Related to a Quotation</div>
+                    </button>
+                </div>
+                <div class="col-md-6 text-center">
+                    <button class="btn btn-success btn-standalone btn-lg py-4 px-4 w-100">
+                        <i class="fa fa-file-o fa-2x mb-2"></i>
+                        <div>Standalone Request</div>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </t>
+</templates> 
